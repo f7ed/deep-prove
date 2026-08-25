@@ -1,0 +1,4 @@
+baseline_autoregressive_time,baseline_incremental_decode_time,baseline_prefill_time,baseline_trace_generation_inference_time,context_generation_time,inference_time,kv_cache_mode,max_context,min_user_len,model_name,num_threads,quantization_time
+10944,655,10288,10691,14703,21636,post-requant,64,62,gpt2,14,1719
+11240,617,10623,11055,14682,22296,post-requant,64,62,gpt2,14,1710
+10654,633,10020,10446,15300,21101,post-requant,64,62,gpt2,14,1721

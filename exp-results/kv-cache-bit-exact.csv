@@ -1,0 +1,3 @@
+decode_tokens,generated_tokens,kv_cache_correctness_equal,kv_cache_mode,max_context,min_user_len,model_name,num_threads,quantization_time,verified_attention_and_logits,verified_kv_tensors
+16,1340 50 3963 3336 376 3843 11335 3963 3336 376 3843 11335 3963 3336 376 3843,true,pre-requant-vs-post-requant,80,64,gpt2,14,1858,208,384
+16,1340 50 3963 3336 376 3843 11335 3963 3336 376 3843 11335 3963 3336 376 3843,true,pre-requant-vs-post-requant,80,64,gpt2,14,1876,208,384

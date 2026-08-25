@@ -18,6 +18,10 @@ pub mod softmax;
 pub struct ConcatenationCache<N: TensorTypeParam> {
     cached_tensor: Option<WrappedTensor<N>>,
     caching_info: CachingInfo,
+    /// Inference runners may temporarily bypass this cache while preserving
+    /// its static rank and concatenation metadata.
+    #[serde(skip)]
+    disabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
@@ -78,6 +82,7 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
         Self {
             cached_tensor: None,
             caching_info,
+            disabled: false,
         }
     }
 
@@ -86,11 +91,19 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
         Self {
             cached_tensor: None,
             caching_info,
+            disabled: false,
         }
     }
 
     pub fn reset(&mut self) {
         self.cached_tensor = None;
+    }
+
+    pub fn set_disabled(&mut self, disabled: bool) {
+        self.disabled = disabled;
+        if disabled {
+            self.reset();
+        }
     }
     pub fn is_initialized(&self) -> bool {
         self.cached_tensor.is_some()
@@ -104,6 +117,10 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
         &mut self,
         new_tensor: WrappedTensor<N>,
     ) -> anyhow::Result<WrappedTensor<N>> {
+        if self.disabled {
+            return Ok(new_tensor);
+        }
+
         // We retrieve the concatenation dim here to enforce that the tensor to be cached is valid.
         let rank = new_tensor.rank();
         let concatenation_dim = self.get_concatenation_dim(rank)?;
@@ -128,6 +145,13 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
     /// Given a [`Shape`], returns the next shape after concatenation.
     /// Here `padding_mode` determines whether to pad the new shape to the next power of two.
     pub fn next_shape(&self, shape: Shape, padding_mode: PaddingMode) -> anyhow::Result<Shape> {
+        if self.disabled {
+            return Ok(match padding_mode {
+                PaddingMode::NoPadding => shape,
+                PaddingMode::Padding => shape.next_power_of_two(),
+            });
+        }
+
         let mut new_shape = shape;
         let rank = new_shape.rank();
         let concatenation_dim = self.get_concatenation_dim(rank)?;
@@ -166,5 +190,35 @@ impl<N: TensorTypeParam> ConcatenationCache<N> {
                 panic!("Should not be accessing caching info for Dynamic variant")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Element;
+
+    #[test]
+    fn concatenation_cache_can_be_temporarily_bypassed() {
+        let mut cache = ConcatenationCache::<Element>::new(1, 0);
+        let first = WrappedTensor::try_from(vec![1, 2]).unwrap();
+
+        cache.set_disabled(true);
+        let bypassed = cache.concatenate(first.clone()).unwrap();
+        assert_eq!(bypassed.get_data(), vec![1, 2]);
+        assert!(!cache.is_initialized());
+        assert_eq!(
+            cache
+                .next_shape(Shape::from([2]), PaddingMode::NoPadding)
+                .unwrap(),
+            Shape::from([2])
+        );
+
+        cache.set_disabled(false);
+        cache.concatenate(first).unwrap();
+        let concatenated = cache
+            .concatenate(WrappedTensor::try_from(vec![3]).unwrap())
+            .unwrap();
+        assert_eq!(concatenated.get_data(), vec![1, 2, 3]);
     }
 }

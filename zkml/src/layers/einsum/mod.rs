@@ -280,6 +280,16 @@ where
             }
         });
     }
+
+    /// Temporarily bypass all output caches without changing their static
+    /// shape/concatenation configuration.
+    pub fn set_caches_disabled(&self, disabled: bool) {
+        self.caches.iter().for_each(|cache| {
+            if let Some(cache) = cache {
+                cache.lock().unwrap().set_disabled(disabled);
+            }
+        });
+    }
     /// Getter for the requantisation flag.
     pub fn requantise(&self) -> bool {
         self.requantise

@@ -119,15 +119,15 @@ Q/K/V projection -> wide integer K/V -> ReQuant once
 
 ### Phase A — Inspect Before Modifying
 
-- [ ] Locate where GPT-2 Q, K, and V are generated.
-- [ ] Record tensor types, effective bit widths, layouts, and scales immediately after projection.
-- [ ] Locate every requantization boundary on the Q/K/V and attention paths.
-- [ ] Identify the exact representation consumed by QKᵀ and attention-value multiplication.
-- [ ] Determine whether a persistent autoregressive KV cache already exists.
-- [ ] Identify its owning structs, cache lifetime, concatenation dimension, and stored representation.
-- [ ] Trace a prefix plus at least one decode step to determine whether historical K/V are requantized again.
-- [ ] Determine whether delayed requantization, graph transforms, or operator fusion alter this path.
-- [ ] Report concrete files, structs, functions, tensor shapes, and scale transitions.
+- [x] Locate where GPT-2 Q, K, and V are generated.
+- [x] Record tensor types, effective bit widths, layouts, and scales immediately after projection.
+- [x] Locate every requantization boundary on the Q/K/V and attention paths.
+- [x] Identify the exact representation consumed by QKᵀ and attention-value multiplication.
+- [x] Determine whether a persistent autoregressive KV cache already exists.
+- [x] Identify its owning structs, cache lifetime, concatenation dimension, and stored representation.
+- [x] Trace a prefix plus at least one decode step to determine whether historical K/V are requantized again.
+- [x] Determine whether delayed requantization, graph transforms, or operator fusion alter this path.
+- [x] Report concrete files, structs, functions, tensor shapes, and scale transitions.
 
 Likely starting points for inspection include:
 
@@ -151,22 +151,22 @@ If repeated historical requantization is not present, stop after the inspection 
 
 Only after passing the decision gate:
 
-- [ ] Requantize only newly generated K/V.
-- [ ] Store new K/V in the existing cache after requantization.
-- [ ] Reuse historical cached values directly in later attention steps.
-- [ ] Preserve tensor layout, head/group structure, concatenation dimension, scale metadata, causal masking, and positional semantics.
-- [ ] Avoid unrelated refactoring.
-- [ ] Add instrumentation for requantization count/time and KV-cache memory.
+- [x] Requantize only newly generated K/V.
+- [x] Store new K/V in an inference-only cache after requantization.
+- [x] Reuse historical cached values directly in later attention steps.
+- [x] Preserve tensor layout, head/group structure, concatenation dimension, scale metadata, causal masking, and positional semantics.
+- [x] Avoid unrelated refactoring.
+- [x] Add instrumentation for requantization count/time and KV-cache memory.
 
 ### Correctness Tests
 
 For identical prompt and decode inputs, compare original and modified inference at these boundaries:
 
-- [ ] K values after the representation selected for caching.
-- [ ] V values after the representation selected for caching.
-- [ ] Attention output.
-- [ ] Final logits.
-- [ ] Generated token.
+- [x] K values after the representation selected for caching.
+- [x] V values after the representation selected for caching.
+- [x] Attention output.
+- [x] Final logits.
+- [x] Generated token.
 
 Prefer bit-exact equality under DeepProve's integer inference semantics. If equality fails, stop performance interpretation and locate the first differing element and exact rounding/requantization boundary responsible.
 
@@ -195,6 +195,8 @@ Measure separately for every variant and decode length:
 Do not include proof generation in the performance claim for this task; this experiment asks only whether post-ReQuant caching benefits inference while preserving quantized inference semantics.
 
 ### Task 2 Deliverable
+
+Status: completed in `exp-results/kv-cache.md`; raw and median-derived measurements are retained under `exp-results/kv-cache-*.csv`.
 
 Produce an inspection and experiment report containing:
 

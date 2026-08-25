@@ -1,0 +1,6 @@
+phase,original_median_ms,post_requant_median_ms,post_relative_change_pct,interpretation
+inference_time,21349,21636,1.3443,no_reliable_total_improvement
+autoregressive_generation,10943,10944,0.0091,no_material_change
+prompt_prefill,10225,10288,0.6161,unchanged_noise
+incremental_decode,748,633,-15.3743,post_requant_faster
+final_trace_inference,10417,10691,2.6303,unchanged_noise

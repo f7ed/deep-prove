@@ -1,0 +1,2 @@
+chunk_prover,chunk_split,context_generation_time,inference_time,max_context,min_user_len,model_name,num_threads,proof_size,prove_claims,prove_commitment_opening,prove_full,prove_full_memory_peak,quantization_time,token/sec,verify_claims,verify_full,witness_commitment
+131259,0,14565,38459,128,126,gpt2,14,11292990,42184,83827,131389,8096,2210,0.9742063643075143,1363,1538,3750

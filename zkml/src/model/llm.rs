@@ -10,6 +10,7 @@ use crate::{
     quantization::{LLMInferenceObserver, llm_quant::FPTransformModel},
 };
 use std::{
+    collections::HashSet,
     fmt::Display,
     ops::Deref,
     sync::{
@@ -18,6 +19,7 @@ use std::{
         mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -30,8 +32,9 @@ use crate::{
     },
     layers::{Layer, provable::Evaluate},
     model::{
-        BaseRunner, HandleLifetimeRunner, LayerRunner, Model, RunInput, Trace, TrackerRunner,
-        tensor_to_handles, trace::SplittedNodesInfo, wrapped_tensor_to_handles,
+        BaseRunner, HandleLifetimeRunner, KvCacheMetrics, KvCacheMode, KvCacheRunner, LayerCapture,
+        LayerRunner, Model, RunInput, Trace, TrackerRunner, tensor_to_handles,
+        trace::SplittedNodesInfo, wrapped_tensor_to_handles,
     },
     number::Number,
     padding::PaddingMode,
@@ -131,6 +134,31 @@ where
     pub(crate) padding_mode: PaddingMode,
 }
 
+/// Result of an inference-only autoregressive decode benchmark.
+#[derive(Clone, Debug)]
+pub struct DecodeBenchmarkResult {
+    pub generated_tokens: Vec<Element>,
+    pub prefill_time: Duration,
+    pub incremental_decode_times: Vec<Duration>,
+    pub total_time: Duration,
+    pub kv_cache_metrics: KvCacheMetrics,
+    pub layer_captures: Vec<LayerCapture>,
+}
+
+impl DecodeBenchmarkResult {
+    pub fn incremental_decode_time(&self) -> Duration {
+        self.incremental_decode_times.iter().copied().sum()
+    }
+
+    pub fn mean_incremental_decode_time(&self) -> Option<Duration> {
+        if self.incremental_decode_times.is_empty() {
+            None
+        } else {
+            Some(self.incremental_decode_time() / self.incremental_decode_times.len() as u32)
+        }
+    }
+}
+
 impl<N: TensorTypeParam> Driver<N> {
     /// Returns the vocabulary size of the model
     pub fn vocab_size(&self) -> usize {
@@ -199,7 +227,7 @@ impl Driver<f32> {
         if conf.quant_strategy.is_none() {
             conf = conf.with_strategy(quantization_strategy);
         }
-        
+
         let (mut quantized_model, metadata) = to_quantized(self.model, conf)?;
         // just set to one because we run one token after another to derive the full trace.
         quantized_model.input_shapes = vec![Shape::from(vec![1])];
@@ -314,6 +342,21 @@ where
         let input_tokens = input
             .iter()
             .map(|t| t.as_tensor_type_param::<N>())
+            .collect::<Vec<_>>();
+        Tensor::new(Shape::from([input_tokens.len()]), input_tokens)
+    }
+
+    /// Converts prompt tokens for an inference-only decode. Unlike
+    /// [`Self::tokens_to_tensor`], this permits a one-token decode at the model
+    /// context boundary because no extra trace-regeneration token is needed.
+    pub fn tokens_to_decode_tensor(&self, input: &[Token]) -> anyhow::Result<Tensor<N>> {
+        ensure!(
+            input.len() < self.md.config.context_length,
+            "Input sequence length must be less than the context length",
+        );
+        let input_tokens = input
+            .iter()
+            .map(|token| token.as_tensor_type_param::<N>())
             .collect::<Vec<_>>();
         Tensor::new(Shape::from([input_tokens.len()]), input_tokens)
     }
@@ -491,6 +534,10 @@ where
             })
         };
 
+        let autoregressive_start = Instant::now();
+        let mut prefill_time = Duration::ZERO;
+        let mut incremental_decode_time = Duration::ZERO;
+
         // This loop schedules work to be run, when using a GPU backend this allows for multiple
         // kernel calls to be scheduled to increase the hardware occupancy.
         for unpadded_seq_len in num_input_tokens..=max_window {
@@ -508,6 +555,7 @@ where
                 input_handles[0].shape(),
             );
 
+            let step_start = Instant::now();
             self.model
                 .run_with_runner(&mut runner, input_handles)
                 .with_context(|| {
@@ -516,6 +564,12 @@ where
                         unpadded_seq_len - num_input_tokens
                     )
                 })?;
+            let step_time = step_start.elapsed();
+            if unpadded_seq_len == num_input_tokens {
+                prefill_time = step_time;
+            } else {
+                incremental_decode_time += step_time;
+            }
 
             let model_outputs = runner.model_outputs(&self.model.graph)?;
             ensure!(
@@ -555,6 +609,12 @@ where
         full_sentence.extend(generated_tokens);
         // Inference always runs on unpadded tensors. Padding is handled at the proving layer.
         let tensor = Tensor::new(Shape::new(vec![full_sentence.len()]), full_sentence.clone())?;
+        crate::measure::record_timing("baseline_prefill_time", prefill_time);
+        crate::measure::record_timing("baseline_incremental_decode_time", incremental_decode_time);
+        crate::measure::record_timing(
+            "baseline_autoregressive_time",
+            autoregressive_start.elapsed(),
+        );
 
         // Reset the model and its caches, otherwise a single token is
         // generated.
@@ -568,9 +628,14 @@ where
 
         // Use the passed store (worker's remote store) so TensorHandle data
         // is accessible during proving in distributed execution
+        let trace_generation_start = Instant::now();
         let trace = self
             .model
             .run_with_split_nodes_info(vec![tensor], store, split_node_info)?;
+        crate::measure::record_timing(
+            "baseline_trace_generation_inference_time",
+            trace_generation_start.elapsed(),
+        );
         for i in num_input_tokens..full_sentence.len() {
             assert_eq!(
                 trace.outputs()[0].tensor().unwrap().data()[i - 1],
@@ -655,6 +720,111 @@ where
         self.model.reset();
 
         Ok(trace)
+    }
+}
+
+impl Driver<Element> {
+    /// Runs the standard autoregressive generation plus final proof-trace
+    /// inference with the selected inference-only K/V cache representation.
+    pub fn run_elements_with_kv_cache(
+        &self,
+        input_tensor: Tensor<Element>,
+        store: &mut GenStore,
+        cache_mode: KvCacheMode,
+    ) -> anyhow::Result<Trace<Element>> {
+        let runner = BaseRunner::from(store.clone());
+        let runner = KvCacheRunner::new(runner, &self.model.graph, cache_mode)?;
+        self.run_elements_with_runner(input_tensor, store, runner, None)
+    }
+
+    /// Runs exactly `num_new_tokens` generation steps without producing a proof
+    /// trace. This isolates prompt prefill and incremental decode performance
+    /// for the selected K/V cache mode.
+    pub fn run_decode_benchmark(
+        &self,
+        input_tensor: Tensor<Element>,
+        num_new_tokens: usize,
+        store: &mut GenStore,
+        cache_mode: KvCacheMode,
+        verify_post_requant: bool,
+        capture_attention_and_logits: bool,
+    ) -> anyhow::Result<DecodeBenchmarkResult> {
+        ensure!(num_new_tokens > 0, "Must decode at least one token");
+        self.model.reset();
+
+        let prompt_len = input_tensor.data().len();
+        ensure!(
+            prompt_len + num_new_tokens <= self.md.context_length(),
+            "Prompt plus decoded tokens exceeds the model context length"
+        );
+
+        let base_runner = BaseRunner::from(store.clone());
+        let kv_runner = KvCacheRunner::new(base_runner, &self.model.graph, cache_mode)?;
+        let kv_runner = if verify_post_requant {
+            ensure!(
+                cache_mode == KvCacheMode::PostRequant,
+                "K/V cache verification is only available in post-ReQuant mode"
+            );
+            kv_runner.with_verification()
+        } else {
+            kv_runner
+        };
+        let kv_runner = if capture_attention_and_logits {
+            let mut capture_nodes = self
+                .md
+                .transformers
+                .iter()
+                .map(|metadata| metadata.transformer.final_proj_id)
+                .collect::<HashSet<_>>();
+            capture_nodes.insert(self.md.final_proj);
+            kv_runner.with_capture_nodes(capture_nodes)
+        } else {
+            kv_runner
+        };
+        let mut runner = HandleLifetimeRunner::new(kv_runner, &self.model.graph);
+        let mut input_handles = tensor_to_handles(&[input_tensor], &self.model.graph, store)?;
+        let mut generated_tokens = Vec::with_capacity(num_new_tokens);
+        let mut step_times = Vec::with_capacity(num_new_tokens);
+        let total_start = Instant::now();
+
+        for _ in 0..num_new_tokens {
+            let step_start = Instant::now();
+            self.model.run_with_runner(&mut runner, input_handles)?;
+            let model_outputs = runner.model_outputs(&self.model.graph)?;
+            ensure!(
+                model_outputs.len() == 1,
+                "Expected one model output, got {}",
+                model_outputs.len()
+            );
+
+            let output = model_outputs[0]
+                .wrapped_tensor()
+                .context("Model output handle has no tensor data")?;
+            let index = if output.shape().num_elements() == 1 {
+                WrappedTensor::try_from(vec![0])?
+            } else {
+                WrappedTensor::try_from(vec![(prompt_len - 1) as Element])?
+            };
+            let next_token = output.deref().clone().flatten_1d().select(0, index)?;
+            let token = next_token.get_data()[0];
+            generated_tokens.push(token);
+            step_times.push(step_start.elapsed());
+
+            input_handles = wrapped_tensor_to_handles(&[next_token], &self.model.graph, store)?;
+        }
+
+        let total_time = total_start.elapsed();
+        let (kv_cache_metrics, layer_captures) = runner.into_inner().into_metrics_and_captures();
+        self.model.reset();
+
+        Ok(DecodeBenchmarkResult {
+            generated_tokens,
+            prefill_time: step_times[0],
+            incremental_decode_times: step_times.into_iter().skip(1).collect(),
+            total_time,
+            kv_cache_metrics,
+            layer_captures,
+        })
     }
 }
 

@@ -1,0 +1,2 @@
+baseline_autoregressive_time,baseline_incremental_decode_time,baseline_prefill_time,baseline_trace_generation_inference_time,chunk_prover,chunk_split,context_generation_time,inference_time,kv_cache_mode,max_context,min_user_len,model_name,num_threads,proof_size,prove_claims,prove_commitment_opening,prove_full,prove_full_memory_peak,quantization_time,token/sec,verify_claims,verify_full,witness_commitment
+1832,600,1232,1425,30386,0,14412,3258,post-requant,8,6,gpt2,14,7280670,14903,14989,30466,12329,1167,0.2625878027965601,827,987,317

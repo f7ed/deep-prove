@@ -1,12 +1,13 @@
 use std::{fs::File, io::Write};
 
-use anyhow::bail;
+use anyhow::{bail, ensure};
 use ark_bn254::Bn254;
 use clap::{ArgGroup, Parser, ValueEnum, builder::ArgPredicate};
 #[cfg(not(feature = "cuda"))]
 use dp_crypto::arkyper::HyperKZG;
 #[cfg(feature = "cuda")]
 use dp_crypto::arkyper::hyperkzg_gpu::HyperKZGGpu;
+use itertools::Itertools;
 use libc::{RUSAGE_SELF, getrusage, rusage};
 use tenstore::GenStore;
 use timed_core::Output;
@@ -16,6 +17,7 @@ use zkml::{
     ProverContext,
     measure::{self, Measure},
     model::{
+        KvCacheMode,
         exec_graph::InferenceEngine,
         llm::{Driver, LLMVerifierContext, WithMaxContext},
     },
@@ -44,6 +46,32 @@ enum Model {
     GPT2,
     Gemma3,
     Llama2,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+enum CacheMode {
+    #[default]
+    PreRequant,
+    PostRequant,
+}
+
+impl From<CacheMode> for KvCacheMode {
+    fn from(value: CacheMode) -> Self {
+        match value {
+            CacheMode::PreRequant => KvCacheMode::PreRequant,
+            CacheMode::PostRequant => KvCacheMode::PostRequant,
+        }
+    }
+}
+
+impl std::fmt::Display for CacheMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheMode::PreRequant => f.write_str("pre-requant"),
+            CacheMode::PostRequant => f.write_str("post-requant"),
+        }
+    }
 }
 
 impl std::fmt::Display for Model {
@@ -139,6 +167,35 @@ struct LLMArgs {
     /// Measure layer-wise metrics
     #[arg(long, default_value_t = false)]
     measure_layerwise: bool,
+
+    /// Run only prompt prefill plus autoregressive decode, without trace
+    /// generation, proving, or verification.
+    #[arg(long, default_value_t = false, requires = "max_context")]
+    decode_only: bool,
+
+    /// Select the inference-time K/V cache representation.
+    #[arg(long, value_enum, default_value_t = CacheMode::PreRequant)]
+    kv_cache_mode: CacheMode,
+
+    /// Run the standard baseline inference path and write its measurements,
+    /// but skip proof generation and verification.
+    #[arg(long, default_value_t = false, conflicts_with = "decode_only")]
+    inference_only: bool,
+
+    /// Bit-exactly compare every post-ReQuant cached K/V tensor against a
+    /// shadow execution of the original full-history ReQuant path.
+    #[arg(long, default_value_t = false, requires = "decode_only")]
+    verify_kv_cache: bool,
+
+    /// Run Original and post-ReQuant modes on the same prompt and compare K/V,
+    /// attention outputs, final logits, and generated tokens exactly.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "decode_only",
+        conflicts_with = "verify_kv_cache"
+    )]
+    compare_kv_cache: bool,
 }
 
 const HEADER_MODEL: &str = "model_name";
@@ -149,6 +206,19 @@ const HEADER_NUM_THREADS: &str = "num_threads";
 const HEADER_MIN_USER_LEN: &str = "min_user_len";
 const HEADER_INFERENCE_TIME: &str = "inference_time";
 const HEADER_PROOF_SIZE: &str = "proof_size";
+
+const HEADER_CACHE_MODE: &str = "kv_cache_mode";
+const HEADER_DECODE_TOTAL_SECONDS: &str = "decode_total_seconds";
+const HEADER_PREFILL_TIME: &str = "prefill_seconds";
+const HEADER_INCREMENTAL_DECODE_TIME: &str = "incremental_decode_seconds";
+const HEADER_MEAN_INCREMENTAL_DECODE_TIME: &str = "mean_incremental_decode_seconds";
+const HEADER_DECODE_TOKENS: &str = "decode_tokens";
+const HEADER_KV_REQUANT_CALLS: &str = "kv_requant_calls";
+const HEADER_KV_REQUANT_ELEMENTS: &str = "kv_requant_elements";
+const HEADER_KV_REQUANT_TIME: &str = "kv_requant_seconds";
+const HEADER_KV_CACHE_BYTES: &str = "peak_kv_cache_bytes";
+const HEADER_GENERATED_TOKENS: &str = "generated_tokens";
+const HEADER_VERIFIED_KV_TENSORS: &str = "verified_kv_tensors";
 
 fn main() -> anyhow::Result<()> {
     let subscriber = tracing_subscriber::fmt::Subscriber::builder()
@@ -223,6 +293,142 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    if args.decode_only {
+        ensure!(
+            args.min_user_len < max_context,
+            "--min-user-len must be smaller than --max-context for decode-only runs"
+        );
+        let decode_tokens = max_context - args.min_user_len;
+        measure::set_global(premeasure.clone());
+        measure::set(HEADER_MAX_CONTEXT, max_context.to_string());
+        measure::set(HEADER_MIN_USER_LEN, args.min_user_len.to_string());
+        measure::set(HEADER_DECODE_TOKENS, decode_tokens.to_string());
+        measure::set(HEADER_CACHE_MODE, args.kv_cache_mode.to_string());
+
+        let user_tokens = driver.random_sequence(args.min_user_len);
+        let input_tensor = driver.tokens_to_decode_tensor(&user_tokens)?;
+        let mut store = GenStore::default();
+
+        if args.compare_kv_cache {
+            let original = driver.run_decode_benchmark(
+                input_tensor.clone(),
+                decode_tokens,
+                &mut store,
+                KvCacheMode::PreRequant,
+                false,
+                true,
+            )?;
+            let prototype = driver.run_decode_benchmark(
+                input_tensor,
+                decode_tokens,
+                &mut store,
+                KvCacheMode::PostRequant,
+                true,
+                true,
+            )?;
+            ensure!(
+                original.generated_tokens == prototype.generated_tokens,
+                "Generated tokens differ between pre- and post-ReQuant K/V cache modes"
+            );
+            ensure!(
+                original.layer_captures == prototype.layer_captures,
+                "Attention output or final logits differ between pre- and post-ReQuant K/V cache modes"
+            );
+
+            measure::set(
+                HEADER_GENERATED_TOKENS,
+                prototype.generated_tokens.iter().join(" "),
+            );
+            measure::set(HEADER_CACHE_MODE, "pre-requant-vs-post-requant");
+            measure::set(
+                HEADER_VERIFIED_KV_TENSORS,
+                prototype.kv_cache_metrics.verified_kv_tensors,
+            );
+            measure::set(
+                "verified_attention_and_logits",
+                prototype.layer_captures.len(),
+            );
+            measure::set("kv_cache_correctness_equal", true);
+            info!(
+                "K/V cache correctness comparison passed: {} K/V tensors and {} attention/logit captures were bit-exact; generated={:?}",
+                prototype.kv_cache_metrics.verified_kv_tensors,
+                prototype.layer_captures.len(),
+                prototype.generated_tokens,
+            );
+            measure::to_csv(&args.bench)?;
+            return Ok(());
+        }
+
+        let result = measure::r(HEADER_INFERENCE_TIME, || {
+            driver.run_decode_benchmark(
+                input_tensor,
+                decode_tokens,
+                &mut store,
+                args.kv_cache_mode.into(),
+                args.verify_kv_cache,
+                false,
+            )
+        })?;
+
+        let incremental_time = result.incremental_decode_time();
+        let mean_incremental_time = result
+            .mean_incremental_decode_time()
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or_default();
+        measure::set(HEADER_DECODE_TOTAL_SECONDS, result.total_time.as_secs_f64());
+        measure::set(HEADER_PREFILL_TIME, result.prefill_time.as_secs_f64());
+        measure::set(
+            HEADER_INCREMENTAL_DECODE_TIME,
+            incremental_time.as_secs_f64(),
+        );
+        measure::set(HEADER_MEAN_INCREMENTAL_DECODE_TIME, mean_incremental_time);
+        measure::set(
+            HEADER_KV_REQUANT_CALLS,
+            result.kv_cache_metrics.kv_requant_calls,
+        );
+        measure::set(
+            HEADER_KV_REQUANT_ELEMENTS,
+            result.kv_cache_metrics.kv_requant_elements,
+        );
+        measure::set(
+            HEADER_KV_REQUANT_TIME,
+            result.kv_cache_metrics.kv_requant_time.as_secs_f64(),
+        );
+        measure::set(
+            HEADER_KV_CACHE_BYTES,
+            result.kv_cache_metrics.peak_kv_cache_bytes(),
+        );
+        measure::set(
+            HEADER_GENERATED_TOKENS,
+            result.generated_tokens.iter().join(" "),
+        );
+        measure::set(
+            HEADER_VERIFIED_KV_TENSORS,
+            result.kv_cache_metrics.verified_kv_tensors,
+        );
+        measure::set("decode_only_peak_rss", peak_rss_bytes());
+
+        info!(
+            "Decode-only result: mode={}, prompt={}, decode={}, total={:.6}s, prefill={:.6}s, incremental={:.6}s, K/V ReQuant elements={}, K/V ReQuant time={:.6}s, generated={:?}",
+            args.kv_cache_mode,
+            args.min_user_len,
+            decode_tokens,
+            result.total_time.as_secs_f64(),
+            result.prefill_time.as_secs_f64(),
+            incremental_time.as_secs_f64(),
+            result.kv_cache_metrics.kv_requant_elements,
+            result.kv_cache_metrics.kv_requant_time.as_secs_f64(),
+            result.generated_tokens,
+        );
+        measure::to_csv(&args.bench)?;
+        return Ok(());
+    }
+
+    ensure!(
+        !args.distributed || matches!(args.kv_cache_mode, CacheMode::PreRequant),
+        "Post-ReQuant K/V cache mode is not implemented for distributed inference"
+    );
+
     let (prover_ctx, mut verifier_ctx) = if let Some(ref params) = args.load_params {
         info!("Loading proving contexts from {params}.pk and {params}.vk...");
         let prover_ctx = bincode::serde::decode_from_slice(
@@ -268,6 +474,7 @@ fn main() -> anyhow::Result<()> {
 
         measure::set(HEADER_MAX_CONTEXT, max_ctx.to_string());
         measure::set(HEADER_MIN_USER_LEN, user_prompt.to_string());
+        measure::set(HEADER_CACHE_MODE, args.kv_cache_mode.to_string());
 
         driver.with_max_context(max_ctx);
         let user_tokens = driver.random_sequence(user_prompt);
@@ -295,11 +502,24 @@ fn main() -> anyhow::Result<()> {
             (
                 measure::r(HEADER_INFERENCE_TIME, || {
                     info!("Running inference...");
-                    driver.run_elements(input_tensor, &mut GenStore::default())
+                    if matches!(args.kv_cache_mode, CacheMode::PostRequant) {
+                        driver.run_elements_with_kv_cache(
+                            input_tensor,
+                            &mut GenStore::default(),
+                            KvCacheMode::PostRequant,
+                        )
+                    } else {
+                        driver.run_elements(input_tensor, &mut GenStore::default())
+                    }
                 })?,
                 None,
             )
         };
+
+        if args.inference_only {
+            measure::to_csv(&args.bench)?;
+            continue;
+        }
 
         if args.memory {
             info!(

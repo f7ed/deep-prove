@@ -52,6 +52,58 @@ Raw aggregate outputs:
 - `exp-results/baseline-seq64.csv`
 - `exp-results/baseline-seq128.csv`
 
+## Post-ReQuant KV Cache: Effect on Baseline `inference_time`
+
+The earlier `decode +4` experiment means “start with a 64-token prompt and request four generated tokens.” It is a pure decode workload and is not the same metric as this file's original `inference_time`.
+
+For `--sequence 64`, DeepProve instead starts with 62 prompt tokens and keeps two generated tokens. The measured `inference_time` wraps the complete `driver.run_elements(...)` call:
+
+```text
+62-token prompt forward
+  + two one-token incremental forwards
+  + output handling/cache reset
+  + one final 64-token full inference that produces the proof trace
+```
+
+The prompt forward produces the first retained new token. Of the following two one-token forwards, one produces the second retained token and the last scheduled output is discarded so the final full inference can regenerate the proof trace in the repository's expected form.
+
+The post-ReQuant prototype was therefore connected to the standard `run_elements` generation loop. The final full-sequence trace inference remains the original graph execution, so proving semantics and the returned trace are unchanged.
+
+Three interleaved runs per mode used the same prompt seed and configuration. The table reports medians:
+
+| Timed region | Original | Post-ReQuant | Change |
+|---|---:|---:|---:|
+| Baseline `inference_time` | 21.349 s | 21.636 s | 1.3% slower |
+| Autoregressive phase | 10.943 s | 10.944 s | no material change |
+| 62-token prefill inside that phase | 10.225 s | 10.288 s | 0.6% slower/noise |
+| Two incremental forwards | 748 ms | 633 ms | **15.4% faster** |
+| Final 64-token trace inference | 10.417 s | 10.691 s | 2.6% slower/noise |
+
+The relevant cache work is faster, but it saves only about 115 ms here. The two unchanged operations—prompt prefill and final trace inference—consume roughly 20.5 of the 21.3 seconds and have larger run-to-run variation than the saved time. Consequently, this experiment does **not** show a reliable improvement in the `baseline.md` total `inference_time`; its median happened to be 287 ms slower.
+
+This does not contradict the longer decode experiment. Post-ReQuant caching becomes useful when many one-token forwards reuse a growing history. The original sequence-64 baseline generates only two retained tokens and then deliberately performs a separate full-sequence trace inference, so it is a weak workload for measuring KV-cache reuse.
+
+The measurement command was:
+
+```bash
+RNG_SEED=20260824 RUST_LOG=info ./target/release/bench-llm \
+  --model gpt2 \
+  --hf openai-community/gpt2 \
+  --sequence 64 \
+  --inference-only \
+  --kv-cache-mode <pre-requant|post-requant> \
+  --num-threads 14 \
+  --bench <RESULT.csv>
+```
+
+`--inference-only` preserves the normal proving-context setup and the exact `run_elements` inference boundary, then skips proof generation and verification after the trace has been produced. It was used only to make repeated inference measurements practical.
+
+Raw and derived data:
+
+- `exp-results/kv-cache-baseline-pre-phases.csv`
+- `exp-results/kv-cache-baseline-post-phases.csv`
+- `exp-results/kv-cache-baseline-summary.csv`
+
 ## Proof-Size Comparison with Published Numbers
 
 The DeepProve paper reports HyperKZG GPT-2 proofs of 8.98 MiB at sequence 64 and 9.89 MiB at sequence 128. This local run produced 9.78 MiB and 10.77 MiB, approximately 0.80 MiB and 0.88 MiB larger. The current repository README contains another reference set, 7.95 MiB and 8.82 MiB, which also does not match either the paper or the current executable.

@@ -1,4 +1,9 @@
-use std::{mem, sync::mpsc, thread};
+use std::{
+    mem,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use crate::{
     Element, NextPowerOfTwo, Shape, Tensor,
@@ -10,6 +15,7 @@ use crate::{
         provable::{Evaluate, OpInfo, ProvingHandle, TrackedDataId},
         requant::Requant,
         transformer::{
+            ConcatenationCache,
             logits::ArgmaxHandle,
             normalisation::{
                 layernorm::evaluate::LayerNormHandle, rmsnorm::evaluate::RMSNormHandle,
@@ -50,6 +56,318 @@ where
     pub(crate) proving_data: ProvingHandle,
     pub(crate) tracked_data: HashMap<TrackedDataId, WrappedTensor<N>>,
     trace_split_info: TraceSplitterInfo<N>,
+}
+
+/// Selects where autoregressive K/V tensors are cached during inference.
+///
+/// This only affects the inference runner. The model graph and the trace used
+/// for proving remain unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KvCacheMode {
+    /// Preserve the model's original behavior: cache wide QKV projection
+    /// outputs before their downstream ReQuant nodes.
+    #[default]
+    PreRequant,
+    /// ReQuantize only the newly projected K/V values and cache the resulting
+    /// attention-ready tensors.
+    PostRequant,
+}
+
+/// Measurements collected for the K/V ReQuant nodes during autoregressive
+/// inference.
+#[derive(Clone, Debug, Default)]
+pub struct KvCacheMetrics {
+    pub kv_requant_calls: usize,
+    pub kv_requant_elements: usize,
+    pub kv_requant_time: Duration,
+    pub peak_kv_cache_elements: usize,
+    pub verified_kv_tensors: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerCapture {
+    pub node_id: NodeId,
+    pub outputs: Vec<Vec<Element>>,
+}
+
+impl KvCacheMetrics {
+    /// Physical cache size for the current unpacked `Element = i64`
+    /// representation.
+    pub fn peak_kv_cache_bytes(&self) -> usize {
+        self.peak_kv_cache_elements * std::mem::size_of::<Element>()
+    }
+}
+
+/// Inference-only runner that can move GPT-style K/V concatenation from the
+/// QKV projection outputs to the corresponding post-ReQuant outputs.
+///
+/// The underlying graph is not rewritten. In post-ReQuant mode the original
+/// wide-integer QKV output caches are temporarily bypassed, while this runner
+/// maintains equivalent caches after the K/V ReQuant nodes.
+pub struct KvCacheRunner<I> {
+    inner: I,
+    mode: KvCacheMode,
+    qkv_nodes: HashSet<NodeId>,
+    kv_requant_caches: HashMap<NodeId, ConcatenationCache<Element>>,
+    verification_caches: Option<HashMap<NodeId, ConcatenationCache<Element>>>,
+    capture_nodes: Option<HashSet<NodeId>>,
+    captures: Vec<LayerCapture>,
+    current_cache_elements: HashMap<NodeId, usize>,
+    metrics: KvCacheMetrics,
+}
+
+impl<I> KvCacheRunner<I> {
+    pub fn new(inner: I, graph: &ModelGraph<Element>, mode: KvCacheMode) -> anyhow::Result<Self> {
+        let qkv_nodes = graph
+            .inner_nodes()
+            .filter_map(|(node_id, layer)| match layer {
+                Layer::EinSum(einsum)
+                    if einsum.check_name(
+                        crate::parser::llm::transformer::attention_layer::ATTENTION_QKV_EINSUM_NAME,
+                    ) =>
+                {
+                    Some(node_id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let mut kv_requant_caches = HashMap::new();
+        for qkv_node_id in qkv_nodes.iter().copied() {
+            let Layer::EinSum(qkv_einsum) = graph
+                .node(qkv_node_id)
+                .and_then(Node::as_inner)
+                .context("QKV node is not an inner EinSum layer")?
+            else {
+                bail!("QKV node is not an EinSum layer");
+            };
+
+            for feed in graph.outgoing_feeds(qkv_node_id) {
+                let source_port = *feed.source().port();
+                if source_port != 1 && source_port != 2 {
+                    continue;
+                }
+
+                let requant_node_id = feed.target().node_id();
+                let is_requant = matches!(
+                    graph.node(requant_node_id).and_then(Node::as_inner),
+                    Some(Layer::Requant(_))
+                );
+                if !is_requant {
+                    continue;
+                }
+
+                let source_cache = qkv_einsum.caches[source_port]
+                    .as_ref()
+                    .context("K/V QKV output is missing its concatenation cache")?;
+                let (rank, concatenation_dim) = source_cache.lock().unwrap().cache_info();
+                kv_requant_caches.insert(
+                    requant_node_id,
+                    ConcatenationCache::new(rank, concatenation_dim),
+                );
+            }
+        }
+
+        ensure!(
+            !qkv_nodes.is_empty(),
+            "No attention QKV EinSum nodes found for K/V cache benchmarking"
+        );
+        ensure!(
+            kv_requant_caches.len() == qkv_nodes.len() * 2,
+            "Expected two K/V ReQuant nodes per QKV projection, found {} for {} QKV nodes",
+            kv_requant_caches.len(),
+            qkv_nodes.len()
+        );
+
+        Ok(Self {
+            inner,
+            mode,
+            qkv_nodes,
+            kv_requant_caches,
+            verification_caches: None,
+            capture_nodes: None,
+            captures: Vec::new(),
+            current_cache_elements: HashMap::new(),
+            metrics: KvCacheMetrics::default(),
+        })
+    }
+
+    /// Enables an inference-only bit-exact check. For every new K/V tensor, a
+    /// shadow pre-ReQuant cache evaluates the original full-history ReQuant and
+    /// compares it with the concatenated post-ReQuant cache output.
+    pub fn with_verification(mut self) -> Self {
+        self.verification_caches = Some(self.kv_requant_caches.clone());
+        self
+    }
+
+    pub fn with_capture_nodes(mut self, capture_nodes: HashSet<NodeId>) -> Self {
+        self.capture_nodes = Some(capture_nodes);
+        self
+    }
+
+    pub fn metrics(&self) -> &KvCacheMetrics {
+        &self.metrics
+    }
+
+    pub fn into_metrics(self) -> KvCacheMetrics {
+        self.metrics
+    }
+
+    pub fn into_metrics_and_captures(self) -> (KvCacheMetrics, Vec<LayerCapture>) {
+        (self.metrics, self.captures)
+    }
+}
+
+impl<I> LayerRunner<Element, RunInput<Element>> for KvCacheRunner<I>
+where
+    I: LayerRunner<Element, RunInput<Element>>,
+{
+    fn model_inputs(
+        &mut self,
+        graph: &ModelGraph<Element>,
+        inputs: &[TensorHandle<Element>],
+    ) -> anyhow::Result<()> {
+        self.inner.model_inputs(graph, inputs)
+    }
+
+    fn run_layer(
+        &mut self,
+        node_id: NodeId,
+        graph: &ModelGraph<Element>,
+        layer: &Layer<Element>,
+        inputs: &RunInput<Element>,
+    ) -> RunResult<Element>
+    where
+        Layer<Element>: Evaluate<Element>,
+    {
+        if self.mode == KvCacheMode::PostRequant && self.qkv_nodes.contains(&node_id) {
+            let Layer::EinSum(einsum) = layer else {
+                unreachable!("QKV node set must contain only EinSum layers")
+            };
+            // Bypass the original wide-integer caches for this projection. The
+            // newly projected K/V values will be cached after ReQuant below.
+            einsum.set_caches_disabled(true);
+        }
+
+        let is_kv_requant = self.kv_requant_caches.contains_key(&node_id);
+        let requant_elements = if is_kv_requant {
+            inputs
+                .input_handles
+                .first()
+                .context("K/V ReQuant node has no input")?
+                .unpadded_shape()
+                .numel()
+        } else {
+            0
+        };
+
+        let expected_full_requant = if self.mode == KvCacheMode::PostRequant {
+            if let Some(verification_caches) = self.verification_caches.as_mut() {
+                if is_kv_requant {
+                    let new_wide_tensor = inputs
+                        .input_handles
+                        .first()
+                        .context("K/V ReQuant node has no input")?
+                        .wrapped_tensor()?
+                        .clone();
+                    let full_wide_tensor = verification_caches
+                        .get_mut(&node_id)
+                        .expect("K/V verification cache must exist")
+                        .concatenate(new_wide_tensor)?;
+                    let expected = layer.evaluate(&[&full_wide_tensor])?;
+                    Some(
+                        expected
+                            .outputs
+                            .into_iter()
+                            .next()
+                            .context("Verified K/V ReQuant has no output")?,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let start = Instant::now();
+        let run_result = self.inner.run_layer(node_id, graph, layer, inputs);
+        let elapsed = start.elapsed();
+
+        if self.mode == KvCacheMode::PostRequant && self.qkv_nodes.contains(&node_id) {
+            let Layer::EinSum(einsum) = layer else {
+                unreachable!("QKV node set must contain only EinSum layers")
+            };
+            // Restore the graph's default behavior for callers outside this
+            // inference-only runner, including full trace generation.
+            einsum.set_caches_disabled(false);
+        }
+        let mut output = run_result?;
+
+        if is_kv_requant {
+            self.metrics.kv_requant_calls += 1;
+            self.metrics.kv_requant_elements += requant_elements;
+            self.metrics.kv_requant_time += elapsed;
+
+            let cache_elements = if self.mode == KvCacheMode::PostRequant {
+                let output_handle = output
+                    .outputs
+                    .first()
+                    .context("K/V ReQuant node has no output")?;
+                let storage_key = output_handle.storage_key().clone();
+                let store = output_handle.store().clone();
+                let new_tensor = output_handle.wrapped_tensor()?.clone();
+                let cached_tensor = self
+                    .kv_requant_caches
+                    .get_mut(&node_id)
+                    .expect("K/V ReQuant cache must exist")
+                    .concatenate(new_tensor)?;
+                let cached_shape = Shape::from(cached_tensor.unpadded_shape());
+                let cached_elements = cached_shape.numel();
+                if let Some(expected) = expected_full_requant {
+                    ensure!(
+                        cached_tensor.get_data() == expected.get_data(),
+                        "Post-ReQuant K/V cache differs from original full-history ReQuant at node {node_id}"
+                    );
+                    self.metrics.verified_kv_tensors += 1;
+                }
+                output.outputs[0] = TensorHandle::from_wrapped_tensor_with_unpadded_shape(
+                    storage_key,
+                    store,
+                    cached_tensor,
+                    cached_shape,
+                );
+                cached_elements
+            } else {
+                // In the original path the ReQuant input is the full cached K/V
+                // tensor produced by the QKV EinSum.
+                requant_elements
+            };
+
+            self.current_cache_elements.insert(node_id, cache_elements);
+            self.metrics.peak_kv_cache_elements = self
+                .metrics
+                .peak_kv_cache_elements
+                .max(self.current_cache_elements.values().sum());
+        }
+
+        if self
+            .capture_nodes
+            .as_ref()
+            .is_some_and(|nodes| nodes.contains(&node_id))
+        {
+            let outputs = output
+                .outputs
+                .iter()
+                .map(|handle| Ok(handle.wrapped_tensor()?.get_data()))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            self.captures.push(LayerCapture { node_id, outputs });
+        }
+
+        Ok(output)
+    }
 }
 
 /// Utility to convert model's input tensors to handles.
