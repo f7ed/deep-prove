@@ -199,6 +199,7 @@ impl Driver<f32> {
         if conf.quant_strategy.is_none() {
             conf = conf.with_strategy(quantization_strategy);
         }
+        
         let (mut quantized_model, metadata) = to_quantized(self.model, conf)?;
         // just set to one because we run one token after another to derive the full trace.
         quantized_model.input_shapes = vec![Shape::from(vec![1])];
